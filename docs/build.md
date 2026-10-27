@@ -319,7 +319,7 @@ This experimental MMVQ path is off by default. Set `GGML_CUDA_Q4K_HALF2=1` to tr
 
 #### GGML_CUDA_FA_Q8_0_Q4_0_VEC
 
-This experimental FlashAttention route is off by default. Set `GGML_CUDA_FA_Q8_0_Q4_0_VEC=1` to use the vector kernel for Q8_0 keys and Q4_0 values on SM86, with head size 256 and query batch widths 6-8. The Q8_0/Q4_0 kernel instance is compiled by default. Other shapes and devices keep the existing dispatch. Performance has not been measured on RTX 30xx.
+This experimental FlashAttention route is off by default. Set `GGML_CUDA_FA_Q8_0_Q4_0_VEC=1` to use the vector kernel for Q8_0 keys and Q4_0 values on SM86, with head size 256 and query batch widths 6-8. It uses two queries per block by default. Set `GGML_CUDA_FA_Q8_0_Q4_0_VEC_NCOLS=1` or `=4` as well to test one or four queries per block. The Q8_0/Q4_0 kernel instance is compiled by default. Other shapes and devices keep the existing dispatch. Performance on RTX 30xx depends on the tested shape and configuration.
 
 ### Unified Memory
 

@@ -1,6 +1,8 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+#include <cstdlib>
+
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
     GGML_UNUSED(cc);
@@ -543,6 +545,15 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
 }
 
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_vec_case_softcap(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float logit_softcap) {
+    if (logit_softcap == 0.0f) {
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, false>(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, true>(ctx, dst);
+    }
+}
+
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -550,6 +561,21 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
+    if constexpr (D == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q4_0) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const char * env = getenv("GGML_CUDA_FA_Q8_0_Q4_0_VEC_NCOLS");
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X && Q->ne[1] >= 6 && Q->ne[1] <= 8 && env != nullptr) {
+            if (env[0] == '1' && env[1] == '\0') {
+                ggml_cuda_flash_attn_ext_vec_case_softcap<D, 1, type_K, type_V>(ctx, dst, logit_softcap);
+                return;
+            }
+            if (env[0] == '4' && env[1] == '\0') {
+                ggml_cuda_flash_attn_ext_vec_case_softcap<D, 4, type_K, type_V>(ctx, dst, logit_softcap);
+                return;
+            }
+        }
+    }
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
