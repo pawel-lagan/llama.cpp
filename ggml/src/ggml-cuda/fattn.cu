@@ -5,6 +5,16 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <cstdlib>
+
+static bool ggml_cuda_fattn_q8_0_q4_0_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_Q8_0_Q4_0_VEC");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
@@ -636,6 +646,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
+            if (GGML_CUDA_FA_Q8_0_Q4_0 && cc == GGML_CUDA_CC_AMPERE_GA10X && Q->ne[0] == 256 && Q->ne[1] >= 6 && Q->ne[1] <= 8 &&
+                    K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && ggml_cuda_fattn_q8_0_q4_0_enabled()) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
                 const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 &&

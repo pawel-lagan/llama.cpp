@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <cstdlib>
 #include <cstdint>
 #include <type_traits>
 
@@ -36,6 +37,167 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 #endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// Experimental Q4_K half2 path; keep the measured DP4A/MMQ route as the default.
+static bool ggml_cuda_q4k_half2_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_Q4K_HALF2");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+
+static __device__ __forceinline__ float q4_k_dot4_half2(
+        const half2 w01, const half2 w23, const int activations) {
+    const float a0 = float((int8_t) (activations >> 0));
+    const float a1 = float((int8_t) (activations >> 8));
+    const float a2 = float((int8_t) (activations >> 16));
+    const float a3 = float((int8_t) (activations >> 24));
+    const half2 a01 = __floats2half2_rn(a0, a1);
+    const half2 a23 = __floats2half2_rn(a2, a3);
+    const float2 p01 = __half22float2(__hmul2(w01, a01));
+    const float2 p23 = __half22float2(__hmul2(w23, a23));
+    return (p01.x + p01.y) + (p23.x + p23.y);
+}
+
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q4_K_q8_1_half2_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int v0 = q4[0];
+    const int v1 = q4[4];
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    const int j = bq8_offset/2;
+    const int jm = j & 1;
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+    const float2 dm = __half22float2(bq4_K->dm);
+    float sums[ncols_dst] = {};
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const int w0 = (v0 >> (4*i)) & 0x0F0F0F0F;
+        const int w1 = (v1 >> (4*i)) & 0x0F0F0F0F;
+        const float d4 = dm.x * sc[i];
+        const float m4 = dm.y * m[i];
+        const half2 w00 = __floats2half2_rn(d4 * float((w0 >> 0) & 0x0F) - m4, d4 * float((w0 >> 8) & 0x0F) - m4);
+        const half2 w01 = __floats2half2_rn(d4 * float((w0 >> 16) & 0x0F) - m4, d4 * float((w0 >> 24) & 0x0F) - m4);
+        const half2 w10 = __floats2half2_rn(d4 * float((w1 >> 0) & 0x0F) - m4, d4 * float((w1 >> 8) & 0x0F) - m4);
+        const half2 w11 = __floats2half2_rn(d4 * float((w1 >> 16) & 0x0F) - m4, d4 * float((w1 >> 24) & 0x0F) - m4);
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8i = y + col*stride_col_y + kby + bq8_offset + i;
+            const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
+            const float d8 = __low2float(bq8i->ds);
+            sums[col] += d8 * (q4_k_dot4_half2(w00, w01, q8[0]) + q4_k_dot4_half2(w10, w11, q8[4]));
+        }
+    }
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        dots[col] = sums[col];
+    }
+}
+#endif
+
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q4_K_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
+
+    int v[2];
+    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
+    const int j = bq8_offset/2;
+    const int jm = j & 1;
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        int u[2 * QR4_K];
+        float d8[QR4_K];
+#pragma unroll
+        for (int i = 0; i < QR4_K; ++i) {
+            const block_q8_1 * bq8i = y + col*stride_col_y + kby + bq8_offset + i;
+            d8[i] = __low2float(bq8i->ds);
+            const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+        }
+        dots[col] = vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+    }
+}
+
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_q5_K_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
+
+    int vl[2];
+    int vh[2];
+    const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+    const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
+
+    const uint16_t * scales = (const uint16_t *) bq5_K->scales;
+    const int j = bq8_offset/2;
+    const int jm = j & 1;
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * sc = (const uint8_t *) aux;
+    const uint8_t * m  = sc + 2;
+
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        int u[2 * QR5_K];
+        float d8[QR5_K];
+#pragma unroll
+        for (int i = 0; i < QR5_K; ++i) {
+            const block_q8_1 * bq8i = y + col*stride_col_y + kby + bq8_offset + i;
+            d8[i] = __low2float(bq8i->ds);
+            const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+        }
+        dots[col] = vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+    }
+}
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
@@ -318,6 +480,23 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X && type == GGML_TYPE_Q4_K &&
+            ggml_cuda_q4k_half2_enabled()) {
+        return ne11 <= MMVQ_MAX_BATCH_SIZE;
+    }
+#endif
+    // On SM86, the MMQ tile route is faster for these K-quants above width 4.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X) {
+        switch (type) {
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 4;
+            default:
+                break;
+        }
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
@@ -618,7 +797,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     return 1;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
+          bool reuse_weights = false, bool half2_weights = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -640,7 +820,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    [[maybe_unused]] constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -767,16 +947,53 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if constexpr (half2_weights && type == GGML_TYPE_Q4_K) {
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                vec_dot_q4_K_q8_1_half2_multi<ncols_dst>(
+                    vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+            }
+        } else
+#endif
+        if constexpr (reuse_weights && type == GGML_TYPE_Q4_K) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                float dots[ncols_dst];
+                vec_dot_q4_K_q8_1_multi<ncols_dst>(
+                    vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+            }
+        } else if constexpr (reuse_weights && type == GGML_TYPE_Q5_K) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                vec_dot_q5_K_q8_1_multi<ncols_dst>(
+                    vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_q_cuda(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_q_cuda(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                        }
                     }
                 }
             }
@@ -1069,6 +1286,30 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (type == GGML_TYPE_Q4_K && c_ncols_dst >= 2 && c_ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X && ggml_cuda_q4k_half2_enabled()) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+#endif
+    if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && c_ncols_dst >= 3 && c_ncols_dst <= 4) {
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
