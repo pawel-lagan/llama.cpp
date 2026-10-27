@@ -11,6 +11,14 @@
 
 ---
 
+## Target Workload
+
+- Supported target GPUs: NVIDIA CUDA GPUs with Ampere or Ada Lovelace architecture only.
+- The target hardware is optimized for FP32 and FP16 computation.
+- Model weights use the Q4_K_M quantization format.
+- The KV cache uses Q4 quantization.
+- When analyzing or proposing optimizations, prioritize this workload; support for other GPU architectures and backends is not required.
+
 ## Guidelines for Contributors
 
 A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. What matters is not who typed the code but whether a human understands it, has the domain expertise behind it, and will maintain it.
