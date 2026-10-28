@@ -1196,6 +1196,7 @@ const ggml_cuda_device_info & ggml_cuda_info();
 
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
 
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
@@ -1442,6 +1443,24 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_q8_cache_retired_buffer {
+    char * ptr;
+    size_t cap;
+    int dev;
+};
+
+struct ggml_cuda_q8_cache_entry {
+    char * ptr = nullptr;
+    size_t cap = 0;
+    int dev = -1;
+    const ggml_tensor * src1 = nullptr;
+    const void * data = nullptr;
+    uint64_t epoch = 0;
+    size_t size = 0;
+    int64_t ne10_padded = 0;
+    uint64_t last_use = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1453,6 +1472,13 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
+
+    struct {
+        ggml_cuda_q8_cache_entry entries[2];
+        uint64_t tick = 0;
+        std::vector<ggml_cuda_q8_cache_retired_buffer> retired;
+    } q8_cache;
+    uint64_t graph_epoch = 1;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

@@ -11157,13 +11157,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover Q4_K/Q5_K multi-column reuse and the SM86 MMQ route above width 4.
-    // GGML_CUDA_Q4K_HALF2=1 also uses the Q4_K cases for its opt-in path.
     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         for (int n = 1; n <= 8; ++n) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
         }
+        for (int n = 5; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, n, 4096, { 1, 1 }, { 1, 1 }));
+        }
     }
+    // Both matmuls consume the same activation, exercising Q8_1 cache reuse within one graph.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 1, 4096, { 1, 1 }, { 1, 1 }, { 0, 1, 2, 3 }, 0, 2));
     for (int n : { 5, 8 }) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
     }
@@ -12803,6 +12807,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        for (int bs : {6, 7}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, bs, 14336, {1, 1}, {1, 1}));
+        }
+        for (int bs : {5, 6, 7, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 14336, bs, 4096, {1, 1}, {1, 1}));
         }
     }
 

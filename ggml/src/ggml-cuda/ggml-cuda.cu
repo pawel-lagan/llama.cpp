@@ -183,7 +183,7 @@ static int ggml_cuda_op_offload_min_batch() {
     return min_batch;
 }
 
-static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     if (ggml_cuda_unified_memory_enabled()) {
@@ -744,6 +744,19 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    auto free_q8_buffer = [](char * ptr, int dev) {
+        if (ptr != nullptr) {
+            ggml_cuda_set_device(dev);
+            CUDA_CHECK(cudaFree(ptr));
+        }
+    };
+    for (const auto & entry : q8_cache.entries) {
+        free_q8_buffer(entry.ptr, entry.dev);
+    }
+    for (const auto & retired : q8_cache.retired) {
+        free_q8_buffer(retired.ptr, retired.dev);
+    }
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -4903,6 +4916,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    // Cache hits are valid only within one graph evaluation.
+    cuda_ctx->graph_epoch++;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

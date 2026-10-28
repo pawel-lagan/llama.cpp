@@ -313,9 +313,9 @@ Currently supported values: `auto`, `q8`, `q4`.
 
 NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
 
-#### GGML_CUDA_Q4K_HALF2
+#### GGML_CUDA_Q8CACHE
 
-This experimental MMVQ path is off by default. Set `GGML_CUDA_Q4K_HALF2=1` to try half2 Q4_K dequantization with FP32 accumulation on SM86 for batch widths 2-8. It applies only to tensors whose runtime type is `Q4_K`, not every tensor in a `Q4_K_M` model. The current RTX 4070 Ti SUPER test was slower than MMQ at width 8; performance on RTX 30xx has not been measured. Keep the default DP4A/MMQ path unless a benchmark on the target GPU shows a gain.
+MMVQ reuses a Q8_1 activation quantization when the same source tensor and layout are used again in one graph evaluation. The cache uses persistent device buffers, caches Q8_1 results up to 1 MiB on the main CUDA stream, and skips `MUL_MAT_ID`. Set `GGML_CUDA_Q8CACHE=0` to disable it for A/B tests. The cache is otherwise enabled by default.
 
 #### GGML_CUDA_FA_Q8_0_Q4_0_VEC
 

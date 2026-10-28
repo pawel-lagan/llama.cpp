@@ -38,79 +38,6 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// Experimental Q4_K half2 path; keep the measured DP4A/MMQ route as the default.
-static bool ggml_cuda_q4k_half2_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_Q4K_HALF2");
-        return env != nullptr && env[0] == '1' && env[1] == '\0';
-    }();
-    return enabled;
-}
-
-static __device__ __forceinline__ float q4_k_dot4_half2(
-        const half2 w01, const half2 w23, const int activations) {
-    const float a0 = float((int8_t) (activations >> 0));
-    const float a1 = float((int8_t) (activations >> 8));
-    const float a2 = float((int8_t) (activations >> 16));
-    const float a3 = float((int8_t) (activations >> 24));
-    const half2 a01 = __floats2half2_rn(a0, a1);
-    const half2 a23 = __floats2half2_rn(a2, a3);
-    const float2 p01 = __half22float2(__hmul2(w01, a01));
-    const float2 p23 = __half22float2(__hmul2(w23, a23));
-    return (p01.x + p01.y) + (p23.x + p23.y);
-}
-
-template <int ncols_dst>
-static __device__ __forceinline__ void vec_dot_q4_K_q8_1_half2_multi(
-        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
-        const int stride_col_y, const int kby, const int kbx, const int iqs,
-        float (&dots)[ncols_dst]) {
-    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
-    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
-    const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
-    const int v0 = q4[0];
-    const int v1 = q4[4];
-    const uint16_t * scales = (const uint16_t *) bq4_K->scales;
-    const int j = bq8_offset/2;
-    const int jm = j & 1;
-    const uint32_t s0 = scales[jm + 0];
-    const uint32_t s2 = scales[jm + 2];
-    const uint32_t s4 = scales[jm + 4];
-    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
-    uint16_t aux[2];
-    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
-    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
-    const uint8_t * sc = (const uint8_t *) aux;
-    const uint8_t * m  = sc + 2;
-    const float2 dm = __half22float2(bq4_K->dm);
-    float sums[ncols_dst] = {};
-
-#pragma unroll
-    for (int i = 0; i < QR4_K; ++i) {
-        const int w0 = (v0 >> (4*i)) & 0x0F0F0F0F;
-        const int w1 = (v1 >> (4*i)) & 0x0F0F0F0F;
-        const float d4 = dm.x * sc[i];
-        const float m4 = dm.y * m[i];
-        const half2 w00 = __floats2half2_rn(d4 * float((w0 >> 0) & 0x0F) - m4, d4 * float((w0 >> 8) & 0x0F) - m4);
-        const half2 w01 = __floats2half2_rn(d4 * float((w0 >> 16) & 0x0F) - m4, d4 * float((w0 >> 24) & 0x0F) - m4);
-        const half2 w10 = __floats2half2_rn(d4 * float((w1 >> 0) & 0x0F) - m4, d4 * float((w1 >> 8) & 0x0F) - m4);
-        const half2 w11 = __floats2half2_rn(d4 * float((w1 >> 16) & 0x0F) - m4, d4 * float((w1 >> 24) & 0x0F) - m4);
-#pragma unroll
-        for (int col = 0; col < ncols_dst; ++col) {
-            const block_q8_1 * bq8i = y + col*stride_col_y + kby + bq8_offset + i;
-            const int * q8 = (const int *) bq8i->qs + ((iqs/2)%4);
-            const float d8 = __low2float(bq8i->ds);
-            sums[col] += d8 * (q4_k_dot4_half2(w00, w01, q8[0]) + q4_k_dot4_half2(w10, w11, q8[4]));
-        }
-    }
-#pragma unroll
-    for (int col = 0; col < ncols_dst; ++col) {
-        dots[col] = sums[col];
-    }
-}
-#endif
-
 template <int ncols_dst>
 static __device__ __forceinline__ void vec_dot_q4_K_q8_1_multi(
         const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
@@ -481,12 +408,6 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X && type == GGML_TYPE_Q4_K &&
-            ggml_cuda_q4k_half2_enabled()) {
-        return ne11 <= MMVQ_MAX_BATCH_SIZE;
-    }
-#endif
     // On SM86, the MMQ tile route is faster for these K-quants above width 4.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X) {
         switch (type) {
@@ -798,7 +719,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false,
-          bool reuse_weights = false, bool half2_weights = false>
+          bool reuse_weights = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -947,19 +868,6 @@ static __global__ void mul_mat_vec_q(
         }
 #endif
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        if constexpr (half2_weights && type == GGML_TYPE_Q4_K) {
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                float dots[ncols_dst];
-                vec_dot_q4_K_q8_1_half2_multi<ncols_dst>(
-                    vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
-#pragma unroll
-                for (int j = 0; j < ncols_dst; ++j) {
-                    tmp[j][i] += dots[j];
-                }
-            }
-        } else
-#endif
         if constexpr (reuse_weights && type == GGML_TYPE_Q4_K) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
@@ -1286,19 +1194,6 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if constexpr (type == GGML_TYPE_Q4_K && c_ncols_dst >= 2 && c_ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
-        const int device = ggml_cuda_get_device();
-        const int cc = ggml_cuda_info().devices[device].cc;
-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X && ggml_cuda_q4k_half2_enabled()) {
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, false, true>, launch_params,
-                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-            return;
-        }
-    }
-#endif
     if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && c_ncols_dst >= 3 && c_ncols_dst <= 4) {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
@@ -1693,6 +1588,65 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+static constexpr size_t GGML_CUDA_Q8_CACHE_MAX_SIZE = 1u << 20;
+
+static bool ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, const size_t q8_bytes) {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_Q8CACHE");
+        return env != nullptr && atoi(env) == 0;
+    }();
+    // Stream 0 preserves the quantize-consumer order used by cached buffers.
+    return !disabled && q8_bytes <= GGML_CUDA_Q8_CACHE_MAX_SIZE && ctx.curr_stream_no == 0;
+}
+
+static ggml_cuda_q8_cache_entry * ggml_cuda_q8_cache_find(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t q8_bytes, const int64_t ne10_padded) {
+    for (auto & entry : ctx.q8_cache.entries) {
+        if (entry.epoch == ctx.graph_epoch && entry.src1 == src1 && entry.data == src1->data &&
+                entry.size == q8_bytes && entry.ne10_padded == ne10_padded && entry.dev == ctx.device) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static char * ggml_cuda_q8_cache_claim(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t q8_bytes, const int64_t ne10_padded) {
+    auto & cache = ctx.q8_cache;
+    ggml_cuda_q8_cache_entry * entry = ggml_cuda_q8_cache_find(ctx, src1, q8_bytes, ne10_padded);
+    if (entry == nullptr) {
+        entry = &cache.entries[0];
+        for (auto & candidate : cache.entries) {
+            if (candidate.epoch != ctx.graph_epoch) {
+                entry = &candidate;
+                break;
+            }
+            if (candidate.last_use < entry->last_use) {
+                entry = &candidate;
+            }
+        }
+    }
+
+    entry->last_use = ++cache.tick;
+    if (entry->dev != ctx.device || entry->cap < q8_bytes) {
+        if (entry->ptr != nullptr) {
+            // Captured graphs may still reference the old address.
+            cache.retired.push_back({ entry->ptr, entry->cap, entry->dev });
+            entry->ptr = nullptr;
+        }
+        CUDA_CHECK(ggml_cuda_device_malloc((void **) &entry->ptr, q8_bytes, ctx.device));
+        entry->cap = q8_bytes;
+        entry->dev = ctx.device;
+    }
+
+    entry->src1 = src1;
+    entry->data = src1->data;
+    entry->epoch = ctx.graph_epoch;
+    entry->size = q8_bytes;
+    entry->ne10_padded = ne10_padded;
+    return entry->ptr;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1790,12 +1744,23 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t q8_bytes = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const bool q8_cacheable = ids == nullptr && ggml_cuda_q8_cacheable(ctx, q8_bytes);
+    ggml_cuda_q8_cache_entry * q8_entry =
+        q8_cacheable ? ggml_cuda_q8_cache_find(ctx, src1, q8_bytes, ne10_padded) : nullptr;
+    const bool q8_hit = q8_entry != nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
+    char * src1_q8_1 = q8_hit ? q8_entry->ptr : nullptr;
+
+    if (q8_hit) {
+        q8_entry->last_use = ++ctx.q8_cache.tick;
+    } else {
+        src1_q8_1 = q8_cacheable ?
+            ggml_cuda_q8_cache_claim(ctx, src1, q8_bytes, ne10_padded) : src1_q8_1_local.alloc(q8_bytes);
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1821,7 +1786,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
