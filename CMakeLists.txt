@@ -127,6 +127,7 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
+option(LLAMA_CUDA_NCU_NVTX "llama: add NVTX ranges for Nsight Compute profiling" OFF)
 
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
@@ -223,6 +224,15 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+if (LLAMA_CUDA_NCU_NVTX)
+    if (NOT GGML_CUDA)
+        message(FATAL_ERROR "LLAMA_CUDA_NCU_NVTX requires GGML_CUDA")
+    endif()
+    find_package(CUDAToolkit REQUIRED)
+    include_directories(${CUDAToolkit_INCLUDE_DIRS})
+    add_compile_definitions(LLAMA_CUDA_NCU_NVTX)
 endif()
 
 #

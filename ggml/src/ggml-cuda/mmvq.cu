@@ -7,6 +7,14 @@
 #include <cstdint>
 #include <type_traits>
 
+static bool ggml_cuda_iq4_xs_mmvq_reuse_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_IQ4_XS_MMVQ_REUSE");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
@@ -37,6 +45,37 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 #endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+template <int ncols_dst>
+static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+    int2 values[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        values[j] = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+    }
+
+    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const block_q8_1 * bq8 = y + col*stride_col_y + kby + iqs/4;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int u0 = get_int_b4(bq8->qs, j + 0);
+            const int u1 = get_int_b4(bq8->qs, j + 4);
+            sumi = ggml_cuda_dp4a(values[j].x, u0, sumi);
+            sumi = ggml_cuda_dp4a(values[j].y, u1, sumi);
+        }
+        sumi *= ls - 32;
+        const float d = __half2float(bq4->d) * __low2float(bq8->ds);
+        dots[col] = d * sumi;
+    }
+}
 
 template <int ncols_dst>
 static __device__ __forceinline__ void vec_dot_q4_K_q8_1_multi(
@@ -890,6 +929,17 @@ static __global__ void mul_mat_vec_q(
                     tmp[j][i] += dots[j];
                 }
             }
+        } else if constexpr (reuse_weights && type == GGML_TYPE_IQ4_XS) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float dots[ncols_dst];
+                vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
+                    vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += dots[j];
+                }
+            }
         } else {
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
@@ -1198,6 +1248,19 @@ static void mul_mat_vec_q_switch_fusion(
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
         if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_AMPERE_GA10X) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+    if constexpr (type == GGML_TYPE_IQ4_XS && c_ncols_dst >= 5 && c_ncols_dst <= 8) {
+        const int device = ggml_cuda_get_device();
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) &&
+                (cc == GGML_CUDA_CC_AMPERE_GA10X || cc == GGML_CUDA_CC_ADA_LOVELACE) &&
+                ncols_x == 4096 && ggml_cuda_iq4_xs_mmvq_reuse_enabled()) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,

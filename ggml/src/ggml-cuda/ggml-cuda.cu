@@ -91,6 +91,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -2025,11 +2026,45 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], y->ne[1], y->ne[2]*y->ne[3], device);
 }
 
+static void ggml_cuda_trace_mul_mat_dispatch(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int device, const char * route) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_TRACE_MUL_MAT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!enabled || src1->ne[1] != 6) {
+        return;
+    }
+
+    static std::mutex mutex;
+    static std::unordered_set<std::string> seen;
+    char key[512];
+    std::snprintf(key, sizeof(key), "%d:%p:%s:%d:%lld:%lld:%lld:%lld",
+            device, src0->data, src0->name, (int) src0->type,
+            (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!seen.insert(key).second) {
+            return;
+        }
+    }
+
+    const int cc = ggml_cuda_info().devices[device].cc;
+    GGML_LOG_INFO("%s: MUL_MAT width=6 route=%s device=%d cc=%d weight=%s type=%s src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld] dst=[%lld,%lld,%lld,%lld]\n",
+            __func__, route, device, cc, src0->name, ggml_type_name(src0->type),
+            (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+            (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3]);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
-        return;
+    if (ggml_cuda_op_mul_mat_use_fwht(dst)) {
+        if (ggml_cuda_op_fwht(ctx, src1, dst)) {
+            ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "fwht");
+            return;
+        }
     }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -2038,6 +2073,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "cublas");
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -2046,6 +2082,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+        ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "mmvf");
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -2056,6 +2093,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             && src0->type == GGML_TYPE_F32
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
             && ggml_cuda_should_use_mmvf(src1->type, cc, warp_size, src1->ne, src1->nb, /*ne11 =*/ 1)) {
+        ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "mmvf-transposed");
         ggml_tensor dst_vec = *dst;
         dst_vec.ne[0] = ne11;
         dst_vec.ne[1] = 1;
@@ -2066,17 +2104,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "mmf");
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "mmvq");
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "mmq");
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    ggml_cuda_trace_mul_mat_dispatch(src0, src1, dst, ctx.device, "cublas");
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
@@ -4442,6 +4484,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
+                ggml_cuda_trace_mul_mat_dispatch(up->src[0], up->src[1], up, cuda_ctx->device, "mmq-fused-gate-up");
+                ggml_cuda_trace_mul_mat_dispatch(gate->src[0], gate->src[1], gate, cuda_ctx->device, "mmq-fused-gate-up");
                 ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;

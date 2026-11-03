@@ -317,9 +317,17 @@ NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwel
 
 MMVQ reuses a Q8_1 activation quantization when the same source tensor and layout are used again in one graph evaluation. The cache uses persistent device buffers, caches Q8_1 results up to 1 MiB on the main CUDA stream, and skips `MUL_MAT_ID`. Set `GGML_CUDA_Q8CACHE=0` to disable it for A/B tests. The cache is otherwise enabled by default.
 
+#### GGML_CUDA_TRACE_MUL_MAT
+
+Set `GGML_CUDA_TRACE_MUL_MAT=1` to log the first CUDA dispatch for each source tensor in `MUL_MAT` operations with a destination width of 6. The trace includes tensor name, weight type, tensor shapes, device, compute capability, and the selected route (`MMVQ`, `MMQ`, fused MMQ, `MMF`, `MMVF`, cuBLAS, or FWHT). It includes every CUDA context using that width, including target and draft models. The trace reports dispatch, not kernel time; use a CUDA profiler for timings.
+
 #### GGML_CUDA_FA_Q8_0_Q4_0_VEC
 
 This experimental FlashAttention route is off by default. Set `GGML_CUDA_FA_Q8_0_Q4_0_VEC=1` to use the vector kernel for Q8_0 keys and Q4_0 values on SM86, with head size 256 and query batch widths 6-8. It uses two queries per block by default. Set `GGML_CUDA_FA_Q8_0_Q4_0_VEC_NCOLS=1` or `=4` as well to test one or four queries per block. The Q8_0/Q4_0 kernel instance is compiled by default. Other shapes and devices keep the existing dispatch. Performance on RTX 30xx depends on the tested shape and configuration.
+
+#### GGML_CUDA_IQ4_XS_MMVQ_REUSE
+
+This experimental MMVQ path is off by default. Set `GGML_CUDA_IQ4_XS_MMVQ_REUSE=1` to reuse decoded IQ4_XS weights across columns on SM86 or Ada for widths 5-8 and an input width of 4096. Other widths and shapes keep the existing MMVQ path. Benchmark the full workload before using it outside A/B tests.
 
 ### Unified Memory
 

@@ -33,6 +33,10 @@
 #include <utility>
 #include <fstream>
 
+#if defined(LLAMA_CUDA_NCU_NVTX)
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -4591,14 +4595,38 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        size_t n_spec_verify_tokens = 0;
+        if (spec) {
+            for (const auto & slot : slots) {
+                for (const int32_t i : slot.spec_i_batch) {
+                    if (i >= off && i < off + batch.view.size()) {
+                        n_spec_verify_tokens++;
+                    }
+                }
+            }
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        int64_t t_decode_us = 0;
         queue_tasks.yield_to_queue([&]() {
+            const int64_t t_decode_start = ggml_time_us();
+#if defined(LLAMA_CUDA_NCU_NVTX)
+            if (n_spec_verify_tokens > 0) {
+                nvtxRangePushA("target-verify");
+            }
+#endif
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+#if defined(LLAMA_CUDA_NCU_NVTX)
+            if (n_spec_verify_tokens > 0) {
+                nvtxRangePop();
+            }
+#endif
+            t_decode_us = ggml_time_us() - t_decode_start;
         });
 
         if (ret != 0) {
@@ -4652,6 +4680,7 @@ private:
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch.view.size(), has_output);
+            common_speculative_record_verify_time(spec.get(), t_decode_us, n_spec_verify_tokens);
         }
 
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]

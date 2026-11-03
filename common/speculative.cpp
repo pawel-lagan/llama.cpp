@@ -22,6 +22,10 @@
 #include <random>
 #include <cinttypes>
 
+#if defined(LLAMA_CUDA_NCU_NVTX)
+#include <nvtx3/nvToolsExt.h>
+#endif
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -183,6 +187,7 @@ struct common_speculative_impl {
     int32_t n_max; // maximum draft length after implementation-specific limits
 
     size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
+    size_t n_call_process = 0; // number of times this implementation processed a target batch.
     size_t n_call_draft  = 0; // number of times this implementation was called for generation.
     size_t n_call_accept = 0; // number of times this implementation was called for accumulation.
 
@@ -197,8 +202,11 @@ struct common_speculative_impl {
     const bool gen_perf = true; // whether to generate performance stats.
 
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
+    int64_t t_process_us = 0; // total time spent processing target batches in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+    int64_t t_draft_decode_us = 0; // DFlash draft decode and output sync time in microseconds.
+    int64_t t_selector_us = 0; // DFlash selector time in microseconds.
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
 
@@ -1324,12 +1332,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        int ret = 0;
+        const float * output_nextn = nullptr;
+#if defined(LLAMA_CUDA_NCU_NVTX)
+        if (is_dflash2) {
+            nvtxRangePushA("dflash-draft");
+        }
+#endif
+        {
+            common_time_meas tm(t_draft_decode_us);
+            ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (ret == 0 && (is_dflash2 || is_lilicorr || (is_dspark && params.p_min > 0.0f))) {
+                output_nextn = llama_get_embeddings_nextn(ctx_dft);
+            }
+        }
+#if defined(LLAMA_CUDA_NCU_NVTX)
+        if (is_dflash2) {
+            nvtxRangePop();
+        }
+#endif
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
         }
 
+        common_time_meas tm_selector(t_selector_us);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1345,7 +1372,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dflash2 || is_lilicorr) {
                 // Both DFlash and LiliCorr greedily walk the candidate lattice.
-                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                const float * lattice = output_nextn;
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
@@ -1424,7 +1451,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = params.p_min > 0.0f ? output_nextn : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
@@ -2363,6 +2390,10 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    int64_t t_verify_us = 0;
+    size_t n_verify_batches = 0;
+    size_t n_verify_tokens = 0;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2966,7 +2997,11 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     for (auto & impl : spec->impls) {
-        result = result && impl->process(batch);
+        if (result) {
+            common_time_meas tm(impl->t_process_us, !impl->gen_perf);
+            result = impl->process(batch);
+            impl->n_call_process++;
+        }
     }
 
     return result;
@@ -3098,6 +3133,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     }
 }
 
+void common_speculative_record_verify_time(common_speculative * spec, int64_t time_us, size_t n_tokens) {
+    if (spec == nullptr || n_tokens == 0) {
+        return;
+    }
+
+    spec->t_verify_us += time_us;
+    spec->n_verify_batches++;
+    spec->n_verify_tokens += n_tokens;
+}
+
 // TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
     if (spec == nullptr) {
@@ -3136,6 +3181,14 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
             str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            if (impl->n_call_process > 0) {
+                str_perf += string_format(", process = %.3f ms / %zu calls",
+                        impl->t_process_us / 1000.0, impl->n_call_process);
+            }
+            if (impl->t_draft_decode_us > 0 || impl->t_selector_us > 0) {
+                str_perf += string_format(", draft decode+sync / selector = %.3f / %.3f ms",
+                        impl->t_draft_decode_us / 1000.0, impl->t_selector_us / 1000.0);
+            }
         } else {
             str_perf = "";
         }
@@ -3166,5 +3219,10 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+
+    if (spec->n_verify_batches > 0) {
+        SPC_TRC("target verify batches: %zu, rows: %zu, decode+sync wall: %.3f ms\n",
+                spec->n_verify_batches, spec->n_verify_tokens, spec->t_verify_us / 1000.0);
     }
 }

@@ -11166,6 +11166,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, n, 4096, { 1, 1 }, { 1, 1 }));
         }
     }
+    for (int n = 5; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 128, n, 4096, { 1, 1 }, { 1, 1 }));
+    }
     // Both matmuls consume the same activation, exercising Q8_1 cache reuse within one graph.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 1, 4096, { 1, 1 }, { 1, 1 }, { 0, 1, 2, 3 }, 0, 2));
     for (int n : { 5, 8 }) {
@@ -12816,6 +12819,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         for (int bs : {5, 6, 7, 8}) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 14336, bs, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    for (int64_t k : {4096, 17408}) {
+        for (int n : {5, 6}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 17408, n, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 4096, n, k, {1, 1}, {1, 1}));
         }
     }
 
