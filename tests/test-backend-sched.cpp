@@ -944,6 +944,106 @@ static bool initialize_backends(std::vector<ggml_backend_ptr> & backends) {
     return true;
 }
 
+struct test_meta_top_k_split {
+    int64_t n_cols_first;
+};
+
+static ggml_backend_meta_split_state test_meta_top_k_get_split_state(const ggml_tensor * tensor, void * userdata) {
+    if (strcmp(tensor->name, "input") != 0) {
+        return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1 };
+    }
+
+    const auto * split = (const test_meta_top_k_split *) userdata;
+    ggml_backend_meta_split_state state = { GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1 };
+    state.ne[0] = split->n_cols_first;
+    state.ne[1] = tensor->ne[0] - split->n_cols_first;
+    return state;
+}
+
+static test_result test_meta_top_k_axis0() {
+    static test_meta_top_k_split split = { 4 };
+    ggml_backend_dev_t cpu_dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            cpu_dev = dev;
+            break;
+        }
+    }
+    if (cpu_dev == nullptr) {
+        return skip("no CPU device is available");
+    }
+
+    ggml_backend_dev_t simple_devs[] = { cpu_dev, cpu_dev };
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(simple_devs, 2, test_meta_top_k_get_split_state, &split);
+    ggml_backend_ptr backend(ggml_backend_dev_init(meta_dev, nullptr));
+    if (!backend) {
+        return fail("failed to create the meta backend");
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(meta_dev);
+
+    const ggml_init_params params_input = {
+        /*.mem_size   =*/ 1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_input(ggml_init(params_input));
+    ggml_tensor * input = ggml_new_tensor_2d(ctx_input.get(), GGML_TYPE_F32, 9, 2);
+    ggml_set_name(input, "input");
+    ggml_backend_buffer_ptr buffer_input(ggml_backend_alloc_ctx_tensors_from_buft(ctx_input.get(), buft));
+    if (!buffer_input) {
+        return fail("failed to allocate the split input");
+    }
+
+    const float input_data[] = { 1, 8, 2, 10, 6, 3, 12, 4, 11, -8, 7, 0, 3, 10, 4, 9, 6, 8 };
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+
+    const ggml_init_params params_graph = {
+        /*.mem_size   =*/ 1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_graph(ggml_init(params_graph));
+    ggml_tensor * top_k = ggml_top_k(ctx_graph.get(), input, 3);
+    ggml_tensor * output = ggml_cast(ctx_graph.get(), top_k, GGML_TYPE_F32);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx_graph.get(), 8, /*grads =*/ false);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_tensor * compute_tensors[] = { top_k, output };
+    const size_t compute_size = ggml_backend_buft_get_alloc_size_n(buft, compute_tensors, 2);
+    ggml_backend_buffer_ptr buffer_compute(ggml_backend_buft_alloc_buffer(buft, compute_size));
+    if (!buffer_compute) {
+        return fail("failed to allocate the compute buffer");
+    }
+    ggml_backend_buffer_set_usage(buffer_compute.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    ggml_tallocr tallocr = ggml_tallocr_new(buffer_compute.get());
+    for (ggml_tensor * tensor : compute_tensors) {
+        if (ggml_tallocr_alloc(&tallocr, tensor) != GGML_STATUS_SUCCESS) {
+            return fail("failed to allocate a compute tensor");
+        }
+    }
+
+    const ggml_status status = ggml_backend_graph_compute(backend.get(), graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        return fail("meta graph compute failed: %s", ggml_status_to_string(status));
+    }
+
+    float output_data[6];
+    ggml_backend_tensor_get(output, output_data, 0, sizeof(output_data));
+    const int32_t expected[][3] = { { 3, 6, 8 }, { 4, 6, 8 } };
+    for (int row = 0; row < 2; row++) {
+        int32_t actual[3];
+        for (int col = 0; col < 3; col++) {
+            actual[col] = (int32_t) output_data[row*3 + col];
+        }
+        std::sort(actual, actual + 3);
+        if (!std::equal(actual, actual + 3, expected[row])) {
+            return fail("global top-k indices did not match for row %d", row);
+        }
+    }
+    return TEST_OK;
+}
+
 
 int main(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
@@ -961,11 +1061,17 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
+    case_begin("test_meta_top_k_axis0");
+    case_end(test_meta_top_k_axis0());
+
     std::vector<ggml_backend_ptr> backends;
 
     // nothing to test with synchronous CPU backend only
     if (!initialize_backends(backends)) {
-        return 0;
+        if (print_log || n_ok + n_skip != n_test) {
+            printf("%d/%d tests passed\n", n_ok, n_test);
+        }
+        return n_ok + n_skip == n_test ? 0 : 1;
     }
 
     // the tests only borrow the backends, the ownership stays with this vector
